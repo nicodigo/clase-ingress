@@ -1,0 +1,24 @@
+services:
+  users-api:
+    build:
+      context: ./services/users-api
+    ports:
+      - "8000:8000"
+    networks:
+      - app-network
+
+  frontend:
+    build:
+      context: ./services/frontend
+    ports:
+      - "8080:8080"
+    environment:
+      - USERS_API_URL=http://users-api:8000
+    depends_on:
+      - users-api
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
