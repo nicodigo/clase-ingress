@@ -16,6 +16,25 @@ spec:
     spec:
       containers:
         - name: users-api
-          image: gcr.io/PROJECT_ID/users-api:latest
+          image: us-central1-docker.pkg.dev/compu-mundo-ingress-test/k8s-exercise/users-api:latest
           ports:
             - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"

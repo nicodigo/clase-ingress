@@ -16,9 +16,22 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: gcr.io/PROJECT_ID/frontend:latest
+          image: us-central1-docker.pkg.dev/compu-mundo-ingress-test/k8s-exercise/frontend:latest
           ports:
             - containerPort: 8080
           env:
             - name: USERS_API_URL
               value: "http://users-api-service:8000"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
