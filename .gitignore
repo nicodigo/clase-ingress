@@ -221,3 +221,4 @@ __marimo__/
 *.tfstate
 *.tfstate.*
 .terraform.tfstate.lock.info
+**.plan

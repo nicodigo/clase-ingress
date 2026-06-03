@@ -62,6 +62,18 @@ resource "google_container_cluster" "primary" {
   remove_default_node_pool = true
   initial_node_count       = 1
 
+  node_config {
+      machine_type = "e2-medium"
+      disk_type    = "pd-standard"
+      disk_size_gb = 20
+    }
+
+  addons_config {
+      http_load_balancing {
+        disabled = false
+      }
+    }
+
   deletion_protection = false
 
   ip_allocation_policy {
