@@ -28,10 +28,24 @@ resource "google_project_service" "compute" {
   disable_on_destroy = false
 }
 
+resource "google_project_service" "iam" {
+  service            = "iam.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "google_project_service" "cloudresourcemanager" {
+  service            = "cloudresourcemanager.googleapis.com"
+  disable_on_destroy = false
+}
+
 # VPC
 resource "google_compute_network" "vpc" {
   name                    = "${var.project_id}-vpc"
   auto_create_subnetworks = false
+
+  depends_on = [
+    google_project_service.compute
+  ]
 }
 
 resource "google_compute_subnetwork" "subnet" {
@@ -49,6 +63,10 @@ resource "google_compute_subnetwork" "subnet" {
     range_name    = "services"
     ip_cidr_range = "10.2.0.0/16"
   }
+
+  depends_on = [
+    google_project_service.compute
+  ]
 }
 
 # GKE Cluster
@@ -63,16 +81,16 @@ resource "google_container_cluster" "primary" {
   initial_node_count       = 1
 
   node_config {
-      machine_type = "e2-medium"
-      disk_type    = "pd-standard"
-      disk_size_gb = 20
-    }
+    machine_type = "e2-medium"
+    disk_type    = "pd-standard"
+    disk_size_gb = 20
+  }
 
   addons_config {
-      http_load_balancing {
-        disabled = false
-      }
+    http_load_balancing {
+      disabled = false
     }
+  }
 
   deletion_protection = false
 
@@ -81,7 +99,12 @@ resource "google_container_cluster" "primary" {
     services_secondary_range_name = "services"
   }
 
-  depends_on = [google_project_service.container]
+  depends_on = [
+    google_project_service.compute,
+    google_project_service.container,
+    google_project_service.iam,
+    google_project_service.cloudresourcemanager
+  ]
 }
 
 resource "google_container_node_pool" "primary_nodes" {
@@ -93,12 +116,16 @@ resource "google_container_node_pool" "primary_nodes" {
   node_config {
     machine_type = "e2-medium"
     disk_size_gb = 20
-    disk_type = "pd-standard"
+    disk_type    = "pd-standard"
 
     oauth_scopes = [
       "https://www.googleapis.com/auth/cloud-platform"
     ]
   }
+
+  depends_on = [
+    google_container_cluster.primary
+  ]
 }
 
 # Artifact Registry
@@ -107,5 +134,7 @@ resource "google_artifact_registry_repository" "repo" {
   repository_id = "k8s-exercise"
   format        = "DOCKER"
 
-  depends_on = [google_project_service.artifactregistry]
+  depends_on = [
+    google_project_service.artifactregistry
+  ]
 }
