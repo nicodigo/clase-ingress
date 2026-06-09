@@ -1,0 +1,102 @@
+# ── Namespace ────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: load-api
+
+---
+# ── Deployment ────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: load-api
+  namespace: load-api
+  labels:
+    app: load-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: load-api
+  template:
+    metadata:
+      labels:
+        app: load-api
+    spec:
+      containers:
+        - name: load-api
+          # Reemplazar con la imagen publicada en GCR / Artifact Registry
+          # Ej: gcr.io/<PROJECT_ID>/load-api:latest
+          image: load-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: UVICORN_WORKERS
+              value: "1"           # 1 worker por pod en k8s es lo recomendado
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      # Política de reinicio ante fallos
+      restartPolicy: Always
+
+---
+# ── Service ───────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: load-api-svc
+  namespace: load-api
+spec:
+  selector:
+    app: load-api
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+  type: LoadBalancer          # Genera una IP externa en GKE automáticamente
+
+---
+# ── HorizontalPodAutoscaler ───────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: load-api-hpa
+  namespace: load-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: load-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70   # Escala cuando CPU > 70 %
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80   # Escala cuando memoria > 80 %
