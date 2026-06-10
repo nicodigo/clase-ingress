@@ -1,0 +1,52 @@
+# ── Deployment ────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: load-api-deployment
+  namespace: load-api
+  labels:
+    app: load-api-deployment
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: load-api
+  template:
+    metadata:
+      labels:
+        app: load-api
+    spec:
+      containers:
+        - name: load-api
+          # Reemplazar con la imagen publicada en GCR / Artifact Registry
+          # Ej: gcr.io/<PROJECT_ID>/load-api:latest
+          image: load-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: UVICORN_WORKERS
+              value: "1"           # 1 worker por pod en k8s es lo recomendado
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      # Política de reinicio ante fallos
+      restartPolicy: Always
+

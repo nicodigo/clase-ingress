@@ -1,0 +1,35 @@
+# ── HorizontalPodAutoscaler ───────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: load-api-hpa
+  namespace: load-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: load-api-deployment
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300    # espera 5 min antes de reducir réplicas
+      policies:
+        - type: Replicas
+          value: 1
+          periodSeconds: 60              # máximo 1 réplica menos por minuto
+    scaleUp:
+      stabilizationWindowSeconds: 0     # escala hacia arriba sin demora
