@@ -8,7 +8,7 @@ spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: load-api-deployment
+    name: load-api
   minReplicas: 2
   maxReplicas: 5
   metrics:
@@ -28,7 +28,7 @@ spec:
     scaleDown:
       stabilizationWindowSeconds: 300    # espera 5 min antes de reducir réplicas
       policies:
-        - type: Replicas
+        - type: Pods
           value: 1
           periodSeconds: 60              # máximo 1 réplica menos por minuto
     scaleUp:

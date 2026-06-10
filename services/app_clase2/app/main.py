@@ -1,24 +1,47 @@
 import hashlib
 import random
-import string
 from typing import List
+from contextlib import asynccontextmanager
+from concurrent.futures import ProcessPoolExecutor
 
+import asyncio
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+import gc
+import ctypes
+
+
+
+# ─── Executor lifecycle ───────────────────────────────────────────────────────
+# ProcessPoolExecutor: cada worker corre en su propio proceso → bypasses GIL.
+# Se inicializa en lifespan para que exista exactamente una instancia por
+# proceso de uvicorn y se destruya limpiamente al shutdown.
+
+executor: ProcessPoolExecutor | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global executor
+    # Limitar workers al CPU disponible en el container
+    # 360m ≈ 0.36 CPU → 1 worker es lo correcto para este límite
+    executor = ProcessPoolExecutor(max_workers=1)
+    yield
+    executor.shutdown(wait=False)
+
 
 app = FastAPI(
     title="Load Testing API",
     description="API para generación de carga en CPU y memoria RAM",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # ─── Estado en memoria ────────────────────────────────────────────────────────
-
 users_in_memory: List[dict] = []
 
 
-# ─── Schemas ──────────────────────────────────────────────────────────────────
-
+# ─── Schemas ─────────────────────────────────────────────────────────────────
 class CPURequest(BaseModel):
     data: str = Field(..., description="String de entrada para hashear")
     prefix: str = Field(..., description="Prefijo que debe tener el hash resultante")
@@ -46,80 +69,78 @@ class HealthResponse(BaseModel):
     users_in_memory: int
 
 
-# ─── Endpoints ────────────────────────────────────────────────────────────────
+# ─── Funciones de trabajo ─────────────────────────────────────────────────────
+# Deben ser pickleable (definidas a nivel de módulo) para ProcessPoolExecutor.
+# NO lanzan HTTPException: las excepciones entre procesos se serializan como
+# tipos estándar; FastAPI no puede catchear HTTPException fuera de su contexto.
 
-@app.get("/health", response_model=HealthResponse, tags=["Health"])
-def health_check():
-    """Verifica que la API esté operativa."""
-    return HealthResponse(
-        status="ok",
-        users_in_memory=len(users_in_memory),
-    )
-
-
-@app.post("/cpu", response_model=CPUResponse, tags=["CPU"])
-def cpu_load(request: CPURequest):
-    """
-    Genera carga en CPU buscando un nonce tal que:
-    SHA-256(data + nonce) empiece con el prefijo indicado.
-
-    Equivalente a un mini proof-of-work.
-    """
-    prefix = request.prefix.lower()
-    base = request.data
+def _compute_hash(data: str, prefix: str) -> dict:
     nonce = 0
-
     while True:
-        candidate = f"{base}{nonce}".encode()
-        digest = hashlib.sha256(candidate).hexdigest()
+        digest = hashlib.sha256(f"{data}{nonce}".encode()).hexdigest()
         if digest.startswith(prefix):
-            return CPUResponse(
-                hash=digest,
-                nonce=nonce,
-                iterations=nonce + 1,
-                prefix=prefix,
-            )
+            return {
+                "hash": digest,
+                "nonce": nonce,
+                "iterations": nonce + 1,
+                "prefix": prefix,
+            }
         nonce += 1
-
-        # Límite de seguridad para evitar loops infinitos ante prefijos imposibles
         if nonce > 10_000_000:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"No se encontró hash con prefijo '{prefix}' "
-                    f"en 10.000.000 iteraciones. Usá un prefijo más corto."
-                ),
-            )
+            # ValueError viaja correctamente entre procesos via pickle
+            raise ValueError("Prefijo no encontrado en 10 000 000 iteraciones")
 
 
-@app.post("/memory", response_model=MemoryResponse, tags=["Memory"])
-def memory_load(request: MemoryRequest):
-    """
-    Genera `count` usuarios con legajo y DNI aleatorios y los retiene en memoria RAM.
-    Los datos se acumulan en cada llamada (no se reinicia la lista).
-    """
-    new_users = [
+def _generate_users(count: int) -> list:
+    return [
         {
             "legajo": random.randint(10_000, 999_999),
             "dni": random.randint(1_000_000, 99_999_999),
         }
-        for _ in range(request.count)
+        for _ in range(count)
     ]
+
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
+async def health_check():
+    return HealthResponse(status="ok", users_in_memory=len(users_in_memory))
+
+
+@app.post("/cpu", response_model=CPUResponse, tags=["CPU"])
+async def cpu_load(request: CPURequest):
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            executor, _compute_hash, request.data, request.prefix
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return result
+
+
+@app.post("/memory", response_model=MemoryResponse, tags=["Memory"])
+async def memory_load(request: MemoryRequest):
+    # asyncio.to_thread usa el ThreadPoolExecutor default del loop.
+    # Apropiado acá: la generación es mayormente memoria/random, no cómputo puro.
+    new_users = await asyncio.to_thread(_generate_users, request.count)
     users_in_memory.extend(new_users)
-
-    # Muestra de hasta 5 usuarios recién agregados en la respuesta
-    sample = new_users[:5]
-
     return MemoryResponse(
         added=len(new_users),
         total_in_memory=len(users_in_memory),
-        sample=sample,
+        sample=new_users[:5],
     )
 
+def _release_memory() -> None:
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)  # devuelve páginas libres al OS (Linux)
+    except Exception:
+        pass
 
 @app.delete("/memory", tags=["Memory"])
-def clear_memory():
-    """Limpia la lista de usuarios en memoria (útil para tests)."""
+async def clear_memory():
     count = len(users_in_memory)
     users_in_memory.clear()
+    await asyncio.to_thread(_release_memory)
     return {"cleared": count, "total_in_memory": 0}

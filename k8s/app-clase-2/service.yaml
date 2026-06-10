@@ -3,6 +3,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: load-api-service
+  namespace: load-api
   annotations:
     cloud.google.com/app-protocols: '{"http":"HTTP"}'
     cloud.google.com/neg: '{"ingress": true}'

@@ -14,104 +14,137 @@ data:
     const memoryLatency = new Trend('memory_latency_ms', true);
     const healthLatency = new Trend('health_latency_ms', true);
 
-    const cpuErrors     = new Rate('cpu_error_rate');
-    const memoryErrors  = new Rate('memory_error_rate');
+    const cpuErrors    = new Rate('cpu_error_rate');
+    const memoryErrors = new Rate('memory_error_rate');
 
-    const cpuIterations    = new Counter('cpu_requests_total');
-    const memoryIterations = new Counter('memory_requests_total');
+    const cpuRequests    = new Counter('cpu_requests_total');
+    const memoryRequests = new Counter('memory_requests_total');
 
-    // ── Configuración de stages ──────────────────────────────────────────────
+    const BASE_URL = 'http://load-api-service:8080';
+    const HEADERS  = { 'Content-Type': 'application/json' };
+
+    // Stages compartidos para cpu_ramp y memory_ramp (total: 3m30s)
+    const RAMP_STAGES = [
+      { duration: '30s', target: 2  },  // warmup
+      { duration: '60s', target: 5  },  // base
+      { duration: '30s', target: 15 },  // moderado
+      { duration: '30s', target: 30 },  // pico
+      { duration: '30s', target: 5  },  // bajada
+      { duration: '30s', target: 0  },  // cooldown
+    ];
+
+    // ── Escenarios ───────────────────────────────────────────────────────────
     export const options = {
-      stages: [
-        { duration: '30s', target: 2  },  // Calentamiento: tráfico mínimo
-        { duration: '1m',  target: 5  },  // Carga base
-        { duration: '30s', target: 15 },  // Carga moderada en CPU
-        { duration: '30s', target: 30 },  // Pico: CPU debería saturarse
-        { duration: '30s', target: 5  },  // Bajada controlada
-        { duration: '30s', target: 0  },  // Cooldown
-      ],
+      scenarios: {
+        // Canary: 2 VUs constantes durante todo el test.
+        // Objetivo: verificar que /health responde < 500ms
+        // independientemente de la carga en /cpu y /memory.
+        health_canary: {
+          executor: 'constant-vus',
+          vus: 2,
+          duration: '3m30s',
+          exec: 'healthCheck',
+        },
+        // CPU: ProcessPoolExecutor maneja cada request en un proceso separado.
+        // Con prefix '00': ~256 iteraciones SHA-256 promedio por request.
+        // Con prefix '000': ~4096 iteraciones (~16x más carga).
+        cpu_ramp: {
+          executor: 'ramping-vus',
+          startVUs: 0,
+          stages: RAMP_STAGES,
+          exec: 'cpuLoad',
+        },
+        // Memory: asyncio.to_thread evita bloquear el event loop.
+        // 1000 usuarios/request × 30 VUs pico ≈ 27.000 usuarios/s.
+        // La lista se acumula; teardown llama DELETE /memory al final.
+        memory_ramp: {
+          executor: 'ramping-vus',
+          startVUs: 0,
+          stages: RAMP_STAGES,
+          exec: 'memoryLoad',
+        },
+      },
       thresholds: {
-        // La API de health nunca debe tardar más de 500ms
-        'health_latency_ms': ['p(95)<500'],
-        // El 95% de las requests de CPU deben completarse en menos de 8s
-        'cpu_latency_ms': ['p(95)<8000'],
-        // Tasa de error global por debajo del 5%
+        // Invariante principal del fix no-bloqueante:
+        // /health no debe degradarse aunque /cpu esté saturado.
+        'health_latency_ms': ['p(95)<500', 'p(99)<1000'],
+        // /cpu puede tardar hasta 8s en pico de 30 VUs concurrentes.
+        'cpu_latency_ms':    ['p(95)<8000'],
         'cpu_error_rate':    ['rate<0.05'],
         'memory_error_rate': ['rate<0.05'],
       },
     };
 
-    const BASE_URL = 'http://load-api-svc';  // Nombre del Service en k8s
+    // ── Funciones de escenario ────────────────────────────────────────────────
 
-    const HEADERS = { 'Content-Type': 'application/json' };
+    export function healthCheck() {
+      const res = http.get(`${BASE_URL}/health`, { timeout: '5s' });
 
-    // ── Scenario principal ───────────────────────────────────────────────────
-    export default function () {
-      const scenario = (__VU % 3);  // Distribuir VUs entre los tres endpoints
+      check(res, {
+        'health: status 200': (r) => r.status === 200,
+        'health: body ok':    (r) => {
+          try { return JSON.parse(r.body).status === 'ok'; }
+          catch { return false; }
+        },
+      });
 
-      if (scenario === 0) {
-        // ── GET /health ──────────────────────────────────────────────────────
-        const res = http.get(`${BASE_URL}/health`, { timeout: '5s' });
-
-        check(res, {
-          'health: status 200': (r) => r.status === 200,
-          'health: body ok':    (r) => JSON.parse(r.body).status === 'ok',
-        });
-
-        healthLatency.add(res.timings.duration);
-        sleep(1);
-
-      } else if (scenario === 1) {
-        // ── POST /cpu ────────────────────────────────────────────────────────
-        // Prefijo "00" (~256 iteraciones): carga moderada pero consistente.
-        // Subir a "000" multiplica por ~16 la carga de CPU por request.
-        const payload = JSON.stringify({ data: `vu-${__VU}-iter-${__ITER}`, prefix: '00' });
-        const res = http.post(`${BASE_URL}/cpu`, payload, {
-          headers: HEADERS,
-          timeout: '15s',
-        });
-
-        const ok = check(res, {
-          'cpu: status 200': (r) => r.status === 200,
-          'cpu: tiene hash': (r) => {
-            try { return JSON.parse(r.body).hash !== undefined; }
-            catch { return false; }
-          },
-        });
-
-        cpuLatency.add(res.timings.duration);
-        cpuErrors.add(!ok);
-        cpuIterations.add(1);
-        sleep(0.5);
-
-      } else {
-        // ── POST /memory ─────────────────────────────────────────────────────
-        // Cada VU agrega 1.000 usuarios por iteración.
-        // Con 30 VUs en pico: ~30.000 usuarios nuevos por segundo.
-        const payload = JSON.stringify({ count: 1000 });
-        const res = http.post(`${BASE_URL}/memory`, payload, {
-          headers: HEADERS,
-          timeout: '10s',
-        });
-
-        const ok = check(res, {
-          'memory: status 200':   (r) => r.status === 200,
-          'memory: usuarios ok':  (r) => {
-            try { return JSON.parse(r.body).added === 1000; }
-            catch { return false; }
-          },
-        });
-
-        memoryLatency.add(res.timings.duration);
-        memoryErrors.add(!ok);
-        memoryIterations.add(1);
-        sleep(1);
-      }
+      healthLatency.add(res.timings.duration);
+      sleep(1);
     }
 
-    // ── Teardown: limpiar memoria al finalizar el test ───────────────────────
+    export function cpuLoad() {
+      const payload = JSON.stringify({
+        data:   `vu-${__VU}-iter-${__ITER}`,
+        prefix: '0000',
+      });
+
+      const res = http.post(`${BASE_URL}/cpu`, payload, {
+        headers: HEADERS,
+        timeout: '15s',
+      });
+
+      const ok = check(res, {
+        'cpu: status 200': (r) => r.status === 200,
+        'cpu: tiene hash': (r) => {
+          try { return JSON.parse(r.body).hash !== undefined; }
+          catch { return false; }
+        },
+      });
+
+      cpuLatency.add(res.timings.duration);
+      cpuErrors.add(!ok);
+      cpuRequests.add(1);
+      sleep(0.5);
+    }
+
+    export function memoryLoad() {
+      const payload = JSON.stringify({ count: 800 });
+
+      const res = http.post(`${BASE_URL}/memory`, payload, {
+        headers: HEADERS,
+        timeout: '10s',
+      });
+
+      const ok = check(res, {
+        'memory: status 200': (r) => r.status === 200,
+        'memory: added 800': (r) => {
+          try { return JSON.parse(r.body).added === 800; }
+          catch { return false; }
+        },
+      });
+
+      memoryLatency.add(res.timings.duration);
+      memoryErrors.add(!ok);
+      memoryRequests.add(1);
+      sleep(1);
+    }
+
+    // ── Teardown ──────────────────────────────────────────────────────────────
     export function teardown() {
-      http.del(`${BASE_URL}/memory`);
+      for (let i = 0; i < 11; i++) {  // 11 > 2× replicas → probabilidad de miss < 1.6%
+        http.del(`${BASE_URL}/memory`);
+        sleep(0.1);
+      }
     }
 
 ---
@@ -127,7 +160,13 @@ spec:
       containers:
         - name: k6
           image: grafana/k6:latest
-          args: ["run", "--out", "json=/results/output.json", "/scripts/script.js"]
+          args:
+            - run
+            - --out
+            - json=/results/output.json
+            - --summary-trend-stats
+            - avg,p(50),p(90),p(95),p(99),max
+            - /scripts/script.js
           volumeMounts:
             - name: k6-script
               mountPath: /scripts
@@ -136,10 +175,10 @@ spec:
           resources:
             requests:
               cpu: "200m"
-              memory: "128Mi"
+              memory: "256Mi"
             limits:
               cpu: "500m"
-              memory: "256Mi"
+              memory: "512Mi"
       volumes:
         - name: k6-script
           configMap:
