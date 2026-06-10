@@ -1,0 +1,150 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-script
+  namespace: load-api
+data:
+  script.js: |
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import { Trend, Rate, Counter } from 'k6/metrics';
+
+    // ── Métricas personalizadas ──────────────────────────────────────────────
+    const cpuLatency    = new Trend('cpu_latency_ms',    true);
+    const memoryLatency = new Trend('memory_latency_ms', true);
+    const healthLatency = new Trend('health_latency_ms', true);
+
+    const cpuErrors     = new Rate('cpu_error_rate');
+    const memoryErrors  = new Rate('memory_error_rate');
+
+    const cpuIterations    = new Counter('cpu_requests_total');
+    const memoryIterations = new Counter('memory_requests_total');
+
+    // ── Configuración de stages ──────────────────────────────────────────────
+    export const options = {
+      stages: [
+        { duration: '30s', target: 2  },  // Calentamiento: tráfico mínimo
+        { duration: '1m',  target: 5  },  // Carga base
+        { duration: '30s', target: 15 },  // Carga moderada en CPU
+        { duration: '30s', target: 30 },  // Pico: CPU debería saturarse
+        { duration: '30s', target: 5  },  // Bajada controlada
+        { duration: '30s', target: 0  },  // Cooldown
+      ],
+      thresholds: {
+        // La API de health nunca debe tardar más de 500ms
+        'health_latency_ms': ['p(95)<500'],
+        // El 95% de las requests de CPU deben completarse en menos de 8s
+        'cpu_latency_ms': ['p(95)<8000'],
+        // Tasa de error global por debajo del 5%
+        'cpu_error_rate':    ['rate<0.05'],
+        'memory_error_rate': ['rate<0.05'],
+      },
+    };
+
+    const BASE_URL = 'http://load-api-svc';  // Nombre del Service en k8s
+
+    const HEADERS = { 'Content-Type': 'application/json' };
+
+    // ── Scenario principal ───────────────────────────────────────────────────
+    export default function () {
+      const scenario = (__VU % 3);  // Distribuir VUs entre los tres endpoints
+
+      if (scenario === 0) {
+        // ── GET /health ──────────────────────────────────────────────────────
+        const res = http.get(`${BASE_URL}/health`, { timeout: '5s' });
+
+        check(res, {
+          'health: status 200': (r) => r.status === 200,
+          'health: body ok':    (r) => JSON.parse(r.body).status === 'ok',
+        });
+
+        healthLatency.add(res.timings.duration);
+        sleep(1);
+
+      } else if (scenario === 1) {
+        // ── POST /cpu ────────────────────────────────────────────────────────
+        // Prefijo "00" (~256 iteraciones): carga moderada pero consistente.
+        // Subir a "000" multiplica por ~16 la carga de CPU por request.
+        const payload = JSON.stringify({ data: `vu-${__VU}-iter-${__ITER}`, prefix: '00' });
+        const res = http.post(`${BASE_URL}/cpu`, payload, {
+          headers: HEADERS,
+          timeout: '15s',
+        });
+
+        const ok = check(res, {
+          'cpu: status 200': (r) => r.status === 200,
+          'cpu: tiene hash': (r) => {
+            try { return JSON.parse(r.body).hash !== undefined; }
+            catch { return false; }
+          },
+        });
+
+        cpuLatency.add(res.timings.duration);
+        cpuErrors.add(!ok);
+        cpuIterations.add(1);
+        sleep(0.5);
+
+      } else {
+        // ── POST /memory ─────────────────────────────────────────────────────
+        // Cada VU agrega 1.000 usuarios por iteración.
+        // Con 30 VUs en pico: ~30.000 usuarios nuevos por segundo.
+        const payload = JSON.stringify({ count: 1000 });
+        const res = http.post(`${BASE_URL}/memory`, payload, {
+          headers: HEADERS,
+          timeout: '10s',
+        });
+
+        const ok = check(res, {
+          'memory: status 200':   (r) => r.status === 200,
+          'memory: usuarios ok':  (r) => {
+            try { return JSON.parse(r.body).added === 1000; }
+            catch { return false; }
+          },
+        });
+
+        memoryLatency.add(res.timings.duration);
+        memoryErrors.add(!ok);
+        memoryIterations.add(1);
+        sleep(1);
+      }
+    }
+
+    // ── Teardown: limpiar memoria al finalizar el test ───────────────────────
+    export function teardown() {
+      http.del(`${BASE_URL}/memory`);
+    }
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-load-test
+  namespace: load-api
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          args: ["run", "--out", "json=/results/output.json", "/scripts/script.js"]
+          volumeMounts:
+            - name: k6-script
+              mountPath: /scripts
+            - name: results
+              mountPath: /results
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: k6-script
+          configMap:
+            name: k6-script
+        - name: results
+          emptyDir: {}
+      restartPolicy: Never
+  backoffLimit: 0
